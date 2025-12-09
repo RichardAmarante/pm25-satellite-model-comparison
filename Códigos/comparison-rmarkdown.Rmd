@@ -1,0 +1,787 @@
+---
+title: "Uma análise comparativa do material particulado fino no Amazonas"
+subtitle: "CAMS x Donkelar (2022–2023)"
+author: "Richard Amarante Melo"
+date: "08/10/2025"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: false
+    number_sections: false
+    self_contained: true
+---
+
+```{r configuracao, include=FALSE}
+# ==== opções globais / pacotes ====
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(readxl)
+  library(geobr)
+  library(sf)
+  library(scales)
+  library(stringr)
+  library(knitr)
+  library(kableExtra)
+  library(patchwork)
+  library(plotly)
+  library(htmltools)
+})
+
+# opções padrão dos chunks 
+knitr::opts_chunk$set(
+  echo       = FALSE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  fig.align  = "center"
+)
+
+# Paleta Verde que será utilizada ao longo das figuras do markdown
+pal_green_base <- c("#064E3B", "#0E7C66", "#10B981", "#34D399", "#A7F3D0")  # tons de verde do projeto
+pal_green      <- grDevices::colorRampPalette(pal_green_base)              # função que gera gradiente
+
+# alguns atalhos de escala, dependendo do gráfico bugar
+scale_fill_green  <- function(n = 12, ...) ggplot2::scale_fill_manual(values = pal_green(n), ...)
+scale_color_green <- function(n = 12, ...) ggplot2::scale_color_manual(values = pal_green(n), ...)
+
+# função auxiliar para o plotly que converte HEX (#RRGGBB) pra RGB
+hex2rgba <- function(hex, alpha = 0.7){
+  rgb_val <- col2rgb(hex)
+  sprintf("rgba(%d,%d,%d,%.3f)", rgb_val[1], rgb_val[2], rgb_val[3], alpha)
+}
+```
+
+```{r dados, include=FALSE}
+# ==== leitura, funções auxiliares e bases de dados ====
+
+UF_TARGET <- 13 # Código da UF (Amazonas)
+UF_SIGLA  <- "AM" # Sigla do estado
+
+# nomes dos arquivos com os dados de pm2.5
+arq_cams_2022 <- "daily_pm25_all_regions_2022.csv"
+arq_cams_2023 <- "daily_pm25_all_regions_2023.csv"
+arq_don_2022  <- "Donkelar_dados_completos_consolidado_2022.xlsx"
+arq_don_2023  <- "Donkelar_dados_completos_consolidado_2023.xlsx"
+
+# converter data tanto do formato AAAA-MM-DD quanto DD/MM/AAAA, por conta das bases
+parse_date_any <- function(x){
+  d1 <- suppressWarnings(lubridate::ymd(x, quiet = TRUE))
+  d2 <- suppressWarnings(lubridate::dmy(x, quiet = TRUE)) 
+  d1[is.na(d1)] <- d2[is.na(d1)]
+  d1
+}
+
+# leitura da base do CAMS
+ler_cams <- function(arquivo) {
+  readr::read_csv2(
+    arquivo,
+    locale         = readr::locale(decimal_mark = ".", grouping_mark = ","),
+    show_col_types = FALSE,
+    progress       = FALSE
+  )
+}
+
+# leitura da base do Donkelar (aqui o xlsx já tem Ano e Mes separados)
+ler_don <- function(arquivo){
+  readxl::read_xlsx(arquivo) %>% 
+    transmute(
+      cod_mun7  = as.integer(CD_MUN),
+      nome_muni = NM_MUN,
+      uf        = as.integer(stringr::str_sub(cod_mun7, 1, 2)),
+      ano       = as.integer(Ano),
+      mes       = as.integer(Mes),
+      pm25      = as.numeric(`Media_PM25`)
+    ) %>% 
+    filter(uf == UF_TARGET)
+}
+
+# Shape + dicionário de municípios do Amazonas
+muni_am_sf  <- geobr::read_municipality(code_muni = "AM", year = 2020)
+
+muni_am_dic <- muni_am_sf %>% 
+  sf::st_drop_geometry() %>% 
+  transmute(
+    cod_mun7  = as.integer(code_muni), 
+    nome_muni = name_muni
+  )
+
+# CAMS 2022/2023: passando de diário p/ mensal municipal
+cams_long_2022 <- ler_cams(arq_cams_2022) %>% 
+  rename(Date = 1) %>%                                              
+  pivot_longer(-Date, names_to = "CodRes", values_to = "pm25") %>%
+  mutate(
+    cod_mun7 = as.integer(str_remove(CodRes, "^ID_")),
+    uf       = as.integer(str_sub(cod_mun7, 1, 2)), 
+    date     = parse_date_any(Date), 
+    ano      = year(date),
+    mes      = month(date)
+  ) %>% 
+  select(-Date) %>% 
+  filter(uf == UF_TARGET)
+
+cams_long_2023 <- ler_cams(arq_cams_2023) %>% 
+  rename(Date = 1) %>% 
+  pivot_longer(-Date, names_to = "CodRes", values_to = "pm25") %>% 
+  mutate(
+    cod_mun7 = as.integer(str_remove(CodRes, "^ID_")),
+    uf       = as.integer(str_sub(cod_mun7, 1, 2)),
+    date     = parse_date_any(Date),
+    ano      = year(date),
+    mes      = month(date)
+  ) %>% 
+  select(-Date) %>% 
+  filter(uf == UF_TARGET)
+
+# agregação diária -> média mensal por município
+cams_muni_mensal_2022 <- cams_long_2022 %>% 
+  group_by(cod_mun7, uf, ano, mes) %>% 
+  summarise(pm25 = mean(pm25, na.rm = TRUE), .groups = "drop")
+
+cams_muni_mensal_2023 <- cams_long_2023 %>% 
+  group_by(cod_mun7, uf, ano, mes) %>% 
+  summarise(pm25 = mean(pm25, na.rm = TRUE), .groups = "drop")
+
+# juntando 2022+2023 em uma única base mensal
+cams_municipal_mensal_am <- bind_rows(
+  cams_muni_mensal_2022,
+  cams_muni_mensal_2023
+) %>% 
+  left_join(muni_am_dic, by = "cod_mun7") %>% 
+  mutate(
+    fonte     = "CAMS",
+    uf_sigla  = UF_SIGLA,
+    cod_muni6 = as.integer(str_sub(cod_mun7, 1, 6)),
+    date      = ymd(paste(ano, mes, "01"))
+  ) %>% 
+  select(date, cod_muni6, uf_sigla, nome_muni, ano, mes, pm25, fonte, cod_mun7, uf)
+
+# base anual (média anual de cada município)
+cams_municipal_anual_am <- cams_municipal_mensal_am %>% 
+  group_by(cod_mun7, cod_muni6, nome_muni, uf_sigla, ano) %>% 
+  summarise(pm25 = mean(pm25, na.rm = TRUE), .groups = "drop") %>% 
+  mutate(fonte = "CAMS") %>% 
+  select(cod_muni6, uf_sigla, nome_muni, ano, pm25, fonte, cod_mun7)
+
+# Donkelar 2022/2023
+don_muni_mensal_2022 <- ler_don(arq_don_2022)
+don_muni_mensal_2023 <- ler_don(arq_don_2023)
+
+don_municipal_mensal_am <- bind_rows(
+  don_muni_mensal_2022,
+  don_muni_mensal_2023
+) %>% 
+  mutate(
+    fonte     = "Donkelar",
+    uf_sigla  = UF_SIGLA,
+    cod_muni6 = as.integer(str_sub(cod_mun7, 1, 6)),
+    date      = ymd(paste(ano, mes, "01"))
+  ) %>% 
+  select(date, cod_muni6, uf_sigla, nome_muni, ano, mes, pm25, fonte, cod_mun7, uf)
+
+don_municipal_anual_am <- don_municipal_mensal_am %>% 
+  group_by(cod_mun7, cod_muni6, nome_muni, uf_sigla, ano) %>% 
+  summarise(pm25 = mean(pm25, na.rm = TRUE), .groups = "drop") %>% 
+  mutate(fonte = "Donkelar") %>% 
+  select(cod_muni6, uf_sigla, nome_muni, ano, pm25, fonte, cod_mun7)
+
+# Combinando as bases e fazendo corte das linhas acima do percentil 90, pra evitar outliers muito grandes
+mensal_both_am <- bind_rows(
+  cams_municipal_mensal_am %>%
+    select(date, cod_muni6, uf_sigla, nome_muni, ano, mes, pm25, fonte, cod_mun7),
+  don_municipal_mensal_am %>%
+    select(date, cod_muni6, uf_sigla, nome_muni, ano, mes, pm25, fonte, cod_mun7)
+)
+
+thr <- mensal_both_am %>%                                 
+  group_by(ano, fonte) %>% 
+  summarise(p99 = quantile(pm25, 0.99, na.rm = TRUE), .groups = "drop")
+
+mensal_both_trim <- mensal_both_am %>% 
+  left_join(thr, by = c("ano","fonte")) %>% 
+  filter(pm25 <= p99) %>% # remove só o 1% mais extremo
+  select(-p99)
+
+# Categorização usada nos mapas para qualidade do ar
+breaks_pm25 <- c(0, 5, 10, 15, 25, 35)   # pontos de corte
+
+labels_pm25 <- c(
+  "Excelente (0–5]",
+  "Bom (5–10]",
+  "Moderado (10–15]",
+  "Ruim (15–25]",
+  "Péssimo (25–35]"
+)
+
+pm25_to_cat <- function(x){
+  x2 <- pmin(pmax(x, 0), 35 - 1e-8) # garante que valores fiquem no intervalo (0,35]
+  cut(
+    x2,
+    breaks         = breaks_pm25,
+    labels         = labels_pm25,
+    include.lowest = TRUE,
+    right          = TRUE
+  )
+}
+
+# cores em ordem: Excelente → Bom → Moderado → Ruim → Péssimo
+cat_cols <- c(
+  "Excelente (0–5]"   = pal_green(5)[5],
+  "Bom (5–10]"        = pal_green(5)[4],
+  "Moderado (10–15]"  = pal_green(5)[3],
+  "Ruim (15–25]"      = pal_green(5)[2],
+  "Péssimo (25–35]"   = pal_green(5)[1]
+)
+
+# ------------------------------------------------------------
+# Funções de mapa (categóricas, com contornos)
+# ------------------------------------------------------------
+plot_mapa_cat_anual <- function(df_anual, ano_sel, titulo, muni_sf){
+  df_map <- muni_sf %>% 
+    left_join(
+      df_anual %>%
+        filter(ano == ano_sel) %>%
+        mutate(pm25_cat = pm25_to_cat(pm25)),
+      by = c("code_muni" = "cod_mun7")
+    )
+  
+  ggplot(df_map) +
+    geom_sf(aes(fill = pm25_cat), color = "white", size = 0.05) +  # contorno branco fininho
+    scale_fill_manual(
+      values   = cat_cols,
+      drop     = FALSE,
+      na.value = "grey90",
+      name     = "PM2.5 (µg/m³)"
+    ) +
+    guides(fill = guide_legend(override.aes = list(shape = 22, size = 5))) +
+    theme_void(base_size = 12) +
+    theme(
+      legend.position   = "right",
+      legend.key.height = grid::unit(10,"pt"),
+      legend.key.width  = grid::unit(16,"pt")
+    ) +
+    labs(title = NULL)
+}
+
+plot_mapa_cat_bienio <- function(df_mensal, titulo, muni_sf){
+  anual <- df_mensal %>% 
+    filter(ano %in% c(2022,2023)) %>% 
+    group_by(cod_mun7, cod_muni6, nome_muni, uf_sigla) %>%
+    summarise(pm25 = mean(pm25, na.rm = TRUE), .groups = "drop")
+  
+  df_map <- muni_am_sf %>% 
+    left_join(
+      anual %>% mutate(pm25_cat = pm25_to_cat(pm25)),
+      by = c("code_muni" = "cod_mun7")
+    )
+  
+  ggplot(df_map) +
+    geom_sf(aes(fill = pm25_cat), color = "white", size = 0.05) +
+    scale_fill_manual(
+      values   = cat_cols,
+      drop     = FALSE,
+      na.value = "grey90",
+      name     = "PM2.5 (µg/m³)"
+    ) +
+    guides(fill = guide_legend(override.aes = list(shape = 22, size = 5))) +
+    theme_void(base_size = 12) +
+    theme(
+      legend.position   = "right",
+      legend.key.height = grid::unit(10,"pt"),
+      legend.key.width  = grid::unit(16,"pt")
+    ) +
+    labs(title = NULL)
+}
+
+# ------------------------------------------------------------
+# Função opcional: deduplicar legenda após ggplotly() (se precisar)
+# ------------------------------------------------------------
+dedup_plotly_legend <- function(p) {
+  if (inherits(p, "ggplot")) p <- ggplotly(p)  # se veio ggplot, converte pra plotly
+  
+  vistos <- character(0)                       # guarda nomes de séries já vistos
+  for (i in seq_along(p$x$data)) {
+    nm <- p$x$data[[i]]$name
+    if (is.null(nm) || nm == "" || grepl("^trace", nm)) {  # séries sem nome “real”
+      p$x$data[[i]]$showlegend <- FALSE
+      next
+    }
+    if (nm %in% vistos) {                     # se já viu esse nome, esconde da legenda
+      p$x$data[[i]]$showlegend <- FALSE
+    } else {
+      vistos <- c(vistos, nm)                 # se é novo, mantém
+      p$x$data[[i]]$showlegend <- TRUE
+    }
+  }
+  p
+}
+
+# ------------------------------------------------------------
+# Bases bianuais por município (p/ Seções 2 e 3)
+# ------------------------------------------------------------
+cams_muni_bienio <- cams_municipal_mensal_am %>% 
+  filter(ano %in% c(2022,2023)) %>% 
+  group_by(cod_mun7, nome_muni) %>% 
+  summarise(pm25_cams = mean(pm25, na.rm = TRUE), .groups = "drop")
+
+don_muni_bienio <- don_municipal_mensal_am %>% 
+  filter(ano %in% c(2022,2023)) %>% 
+  group_by(cod_mun7, nome_muni) %>% 
+  summarise(pm25_don = mean(pm25, na.rm = TRUE), .groups = "drop")
+
+wide_bienio <- cams_muni_bienio %>% 
+  inner_join(don_muni_bienio, by = c("cod_mun7","nome_muni")) %>% 
+  mutate(
+    diff      = pm25_don - pm25_cams,          # Donkelar − CAMS
+    absdiff   = abs(diff),
+    mean_pair = (pm25_cams + pm25_don)/2
+  )
+
+# ------------------------------------------------------------
+# Base bianual municipal×mês (p/ Seção 3: sazonalidade)
+# ------------------------------------------------------------
+muni_mes_bienio_long <- mensal_both_trim %>% 
+  filter(ano %in% c(2022, 2023)) %>% 
+  group_by(nome_muni, mes, fonte) %>% 
+  summarise(
+    Media = mean(pm25, na.rm = TRUE),
+    SD    = sd(pm25,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+muni_mes_bienio_wide <- muni_mes_bienio_long %>% 
+  mutate(mes = as.integer(mes)) %>% 
+  select(Municipio = nome_muni, Mes = mes, Fonte = fonte, Media, SD) %>% 
+  tidyr::pivot_wider(
+    names_from  = Fonte,
+    values_from = c(Media, SD),
+    names_sep   = "_"
+  ) %>% 
+  transmute(
+    Municipio,
+    Mes,
+    Media_CAMS     = Media_CAMS,
+    Media_Donkelar = Media_Donkelar,
+    CAMS_sd        = SD_CAMS,
+    DK_sd          = SD_Donkelar
+  ) %>% 
+  arrange(Municipio, Mes)
+
+# vetor de rótulos de meses (pra não repetir o c("Jan","Fev",...))
+mes_labels <- c("Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez")
+
+# ------------------------------------------------------------
+# Série temporal mensal (média 2022–2023, estado)
+# ------------------------------------------------------------
+serie_bienio <- mensal_both_trim %>% 
+  filter(ano %in% c(2022,2023)) %>% 
+  group_by(fonte, mes) %>% 
+  summarise(pm25 = mean(pm25, na.rm = TRUE), .groups = "drop") %>% 
+  mutate(
+    mes_lab = factor(
+      mes,
+      levels = 1:12,
+      labels = mes_labels
+    )
+  )
+
+# ------------------------------------------------------------
+# Pares CAMS vs Donkelar por município×mês (2022–2023) p/ Seção 4
+# ------------------------------------------------------------
+cams_m_trim <- mensal_both_trim %>% 
+  filter(fonte == "CAMS", ano %in% c(2022,2023)) %>%
+  select(cod_mun7, nome_muni, ano, mes, pm25_cams = pm25)
+
+don_m_trim  <- mensal_both_trim %>% 
+  filter(fonte == "Donkelar", ano %in% c(2022,2023)) %>%
+  select(cod_mun7, nome_muni, ano, mes, pm25_don  = pm25)
+
+pares_mensais <- inner_join(
+  cams_m_trim,
+  don_m_trim,
+  by = c("cod_mun7","ano","mes")
+) %>%
+  mutate(
+    diff      = pm25_don - pm25_cams,   # Donkelar − CAMS
+    mean_pair = (pm25_cams + pm25_don)/2
+  )
+
+n_pairs <- nrow(pares_mensais)          # número total de pares (só pra referência)
+```
+
+# 1. Introdução
+
+Este relatório compara duas fontes independentes de **PM2,5** para o Amazonas (2022–2023), com foco em padrões espaciais e sazonais.
+
+> • **CAMS:** Reanálise global de composição atmosférica (ECMWF/Copernicus) com assimilação de produtos de satélite para aerossóis (AOD).  
+> • **Donkelar:** Estimativas globais de PM2,5 baseadas em AOD de múltiplos satélites, convertidas em concentração de superfície via GEOS-Chem e ajustadas para reduzir viés ao nível do solo.
+
+O objetivo é avaliar a concordância entre as fontes e entender onde e quanto divergem, identificando padrões consistentes e diferenças sistemáticas na representação do particulado fino no estado.
+
+---
+
+# 2. Mapas de Concentração Anual Média do PM2,5
+
+```{r mapas_bienio, fig.height=6}
+# ---- Mapas bianuais por fonte (legenda manual ao lado) ----
+m_cams_bi <- plot_mapa_cat_bienio(cams_municipal_mensal_am, NULL, muni_am_sf)  # mapa CAMS
+m_don_bi  <- plot_mapa_cat_bienio(don_municipal_mensal_am,  NULL, muni_am_sf)  # mapa Donkelar
+
+# converte ggplot -> plotly e tira legenda (vamos usar legenda “manual” fixada)
+p_bi_cams <- ggplotly(m_cams_bi)
+for(i in seq_along(p_bi_cams$x$data)){
+  p_bi_cams$x$data[[i]]$line$width <- 0.2   # só pra deixar o mapa com borna mais fina
+  p_bi_cams$x$data[[i]]$line$color <- "white"
+}
+p_bi_cams <- p_bi_cams %>% layout(showlegend = FALSE)
+
+p_bi_don <- ggplotly(m_don_bi)
+for(i in seq_along(p_bi_don$x$data)){
+  p_bi_don$x$data[[i]]$line$width <- 0.2
+  p_bi_don$x$data[[i]]$line$color <- "white"
+}
+p_bi_don <- p_bi_don %>% layout(showlegend = FALSE)
+
+
+# monta os dois mapas lado a lado
+row_bi_1 <- subplot(
+  p_bi_cams, p_bi_don,
+  nrows  = 1,
+  shareX = FALSE,
+  shareY = FALSE,
+  margin = 0.04
+) %>%
+  layout(
+    margin = list(b = 40),
+    width  = 1152,
+    height = 420,
+    xaxis  = list(visible = FALSE),
+    yaxis  = list(visible = FALSE),
+    xaxis2 = list(visible = FALSE),
+    yaxis2 = list(visible = FALSE),
+    annotations = list(                        # títulos acima de cada mapa
+      list(
+        x = 0.23, y = 1.04,
+        text = "CAMS — média (2022–2023)",
+        showarrow = FALSE, xref = "paper", yref = "paper",
+        xanchor = "center", font = list(size = 14)
+      ),
+      list(
+        x = 0.77, y = 1.04,
+        text = "Donkelar — média (2022–2023)",
+        showarrow = FALSE, xref = "paper", yref = "paper",
+        xanchor = "center", font = list(size = 14)
+      )
+    )
+  )
+
+# legenda manual fixa usando as mesmas cores da paleta
+legenda_manual <- htmltools::div(
+  style = "display:flex;flex-direction:column;align-items:flex-start;margin-top:-20px;margin-left:20px;",
+  htmltools::tags$b("PM2,5 (µg/m³)"),
+  htmltools::tags$div(
+    style="display:flex;gap:10px;margin-top:5px;",
+    htmltools::tags$span(style="background:#A7F3D0;width:15px;height:15px;display:inline-block;border:1px solid #ccc;"),
+    "Excelente (0–5]"
+  ),
+  htmltools::tags$div(
+    style="display:flex;gap:10px;",
+    htmltools::tags$span(style="background:#34D399;width:15px;height:15px;display:inline-block;border:1px solid #ccc;"),
+    "Bom (5–10]"
+  ),
+  htmltools::tags$div(
+    style="display:flex;gap:10px;",
+    htmltools::tags$span(style="background:#10B981;width:15px;height:15px;display:inline-block;border:1px solid #ccc;"),
+    "Moderado (10–15]"
+  ),
+  htmltools::tags$div(
+    style="display:flex;gap:10px;",
+    htmltools::tags$span(style="background:#0E7C66;width:15px;height:15px;display:inline-block;border:1px solid #ccc;"),
+    "Ruim (15–25]"
+  ),
+  htmltools::tags$div(
+    style="display:flex;gap:10px;",
+    htmltools::tags$span(style="background:#064E3B;width:15px;height:15px;display:inline-block;border:1px solid #ccc;"),
+    "Péssimo (25–35]"
+  )
+)
+
+# layout final: mapas à esquerda, legenda à direita
+htmltools::div(
+  style = "
+    display:flex;
+    align-items:flex-start;
+    justify-content:flex-start;
+    gap:40px;
+    margin-left:-220px;
+  ",
+  htmltools::div(
+    style = 'flex:0 0 950px;',   # largura da área dos mapas
+    row_bi_1
+  ),
+  htmltools::div(
+    style = 'flex:0 0 180px; margin-top:20px; margin-left:10px;',  # coluna da legenda
+    legenda_manual
+  )
+)
+```
+
+---
+
+# 3. Sazonalidade Anual Média
+
+```{r boxplot_bienio, fig.height=6}
+# cores semi-transparentes pro boxplot
+col_cams_fill <- hex2rgba(pal_green(7)[1], 0.65)
+col_don_fill  <- hex2rgba(pal_green(7)[4], 0.65)
+
+bienio_box <- muni_mes_bienio_long %>% 
+  mutate(
+    mes = factor(
+      mes,
+      levels = 1:12,
+      labels = mes_labels
+    )
+  )
+
+lim_pm_bienio <- range(bienio_box$Media, na.rm = TRUE)    # usado no eixo Y
+
+p_bienio <- plot_ly() %>% 
+  add_trace(
+    data = bienio_box %>% filter(fonte == "CAMS"),
+    x = ~mes, y = ~Media,
+    type      = "box",
+    name      = "CAMS",
+    boxpoints = FALSE,
+    fillcolor = col_cams_fill,
+    line      = list(color = "black", width = 1)
+  ) %>% 
+  add_trace(
+    data = bienio_box %>% filter(fonte == "Donkelar"),
+    x = ~mes, y = ~Media,
+    type      = "box",
+    name      = "Donkelar",
+    boxpoints = FALSE,
+    fillcolor = col_don_fill,
+    line      = list(color = "black", width = 1)
+  ) %>% 
+  layout(
+    boxmode = "group",
+    yaxis   = list(title = "PM2,5 (µg/m³)", range = lim_pm_bienio),
+    xaxis   = list(title = "Mês"),
+    legend  = list(title = list(text = "Fonte"))
+  )
+
+htmltools::div(
+  style = "margin-left:-100px;",
+  p_bienio %>% layout(
+    margin = list(b = 60, l = 60, r = 20, t = 10),
+    width  = 1152,
+    height = 440
+  )
+)
+```
+
+---
+
+# 4. Análise de Associação Entre as Fontes
+
+## 4.1 Série Temporal Anual Média
+
+```{r serie_temporal, fig.height = 6}
+col_cams_line <- pal_green(7)[1]    # cor da linha CAMS
+col_don_line  <- pal_green(7)[4]    # cor da linha Donkelar
+
+p_ts <- plot_ly() %>% 
+  add_lines(
+    data = serie_bienio %>% filter(fonte=="CAMS"),
+    x    = ~mes_lab, y = ~pm25,
+    name = "CAMS",
+    line = list(width = 2, color = col_cams_line)
+  ) %>% 
+  add_lines(
+    data = serie_bienio %>% filter(fonte=="Donkelar"),
+    x    = ~mes_lab, y = ~pm25,
+    name = "Donkelar",
+    line = list(width = 2, color = col_don_line)
+  ) %>% 
+  layout(
+    xaxis  = list(title = "Mês"),
+    yaxis  = list(title = "PM2,5 médio (µg/m³)"),
+    legend = list(orientation = "h", x = 0, y = 1.1)
+  )
+
+htmltools::div(
+  style = "margin-left:-100px;",
+  p_ts %>% layout(width = 1152, height = 440)
+)
+```
+
+## 4.2 Gráfico de Dispersão
+
+```{r dispersao_spearman, fig.height=5}
+g_scatter <- ggplot(pares_mensais, aes(x = pm25_don, y = pm25_cams)) +
+  geom_point(alpha = 0.6, size = 1.7, color = pal_green(7)[2]) +
+  geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "dashed", color = "grey40"
+  ) +
+  labs(
+    x = "Donkelar — PM2,5 (µg/m³)",
+    y = "CAMS — PM2,5 (µg/m³)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggplotly(g_scatter)
+```
+
+```{r spearman_resumo}
+# Spearman (rho) considerando todos os pares município×mês
+res_spear <- suppressWarnings(
+  cor.test(
+    pares_mensais$pm25_don,
+    pares_mensais$pm25_cams,
+    method = "spearman",
+    exact  = FALSE
+  )
+)
+res_spear  # saída “bruta” pra referência
+
+rho  <- unname(res_spear$estimate)
+pval <- res_spear$p.value
+
+# classificação simples da magnitude
+mag <- if (abs(rho) < 0.3) {
+  "fraca"
+} else if (abs(rho) < 0.5) {
+  "moderada"
+} else if (abs(rho) < 0.7) {
+  "moderada/forte"
+} else {
+  "forte"
+}
+
+sig <- if (pval < 0.05) {
+  "significativa (p < 0,05)"
+} else {
+  "não significativa (p ≥ 0,05)"
+}
+
+txt_spear <- paste0(
+  "Correlação de Spearman: ρ = ",
+  formatC(rho, digits = 3, format = "f"),
+  " — magnitude ", mag, ", ", sig, "."
+)
+
+htmltools::div(
+  style = "margin:8px 0 18px 0; padding:8px 12px; background:#f7faf9; border-left:4px solid #10B981;",
+  htmltools::HTML(txt_spear)
+)
+```
+
+Conclui-se, portanto, que as duas fontes de medição apresentam uma associação significativa, estatisticamente falando. Além disso, como o coeficiente de correlação estimado é positivo, temos que a associação tende a ocorrer de maneira proporcional (quando um aumenta, o outro tende a acompanhar também).
+
+## 4.3 Gráfico de Bland–Altman
+
+```{r bland_altman, fig.height=5}
+bias    <- mean(pares_mensais$diff, na.rm = TRUE)       # viés médio (Donkelar − CAMS)
+sd_diff <- sd(pares_mensais$diff,   na.rm = TRUE)       # desvio-padrão das diferenças
+loa_u   <- bias + 1.96*sd_diff                          # limite superior de concordância
+loa_l   <- bias - 1.96*sd_diff                          # limite inferior de concordância
+
+g_ba <- ggplot(pares_mensais, aes(x = mean_pair, y = diff)) +
+  geom_point(alpha = 0.6, size = 1.5, color = pal_green(7)[3]) +
+  geom_hline(yintercept = bias,  color = "black") +
+  geom_hline(yintercept = loa_u, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = loa_l, linetype = "dashed", color = "grey40") +
+  labs(
+    x = "Média do par (µg/m³)",
+    y = "Donkelar − CAMS (µg/m³)"
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = bias,
+    label = sprintf("Viés = %.2f", bias),
+    hjust = 1.02, vjust = -0.6, size = 3.2
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = loa_u,
+    label = sprintf("LOA+ = %.2f", loa_u),
+    hjust = 1.02, vjust = -0.6, size = 3.2
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = loa_l,
+    label = sprintf("LOA- = %.2f", loa_l),
+    hjust = 1.02, vjust = 1.4,  size = 3.2
+  ) +
+  theme_minimal(base_size = 12)
+
+ggplotly(g_ba)
+```
+
+```{r bland_altman_interpretacao}
+interpreta_vies <- if (bias > 0) {
+  "Em média, percebemos que Donkelar se mantém acima do CAMS"
+} else if (bias < 0) {
+  "Donkelar, em média, abaixo do CAMS"
+} else {
+  "ausência de viés médio aparente"
+}
+
+txt_ba <- paste0(
+  "Bland–Altman: viés = ", sprintf("%.2f", bias),
+  " (Limites: ", sprintf("%.2f", loa_l), " a ", sprintf("%.2f", loa_u), "). ",
+  "Interpretação: ", interpreta_vies, "."
+)
+
+htmltools::div(
+  style = "margin:8px 0 18px 0; padding:8px 12px; background:#f7faf9; border-left:4px solid #10B981;",
+  htmltools::HTML(txt_ba)
+)
+```
+
+## 4.4 Análise do Viés Médio (IC da Média das Diferenças)
+
+```{r vies_ic_saida}
+# IC 95% para a média de diff (Donkelar − CAMS) via t-test (μ = 0)
+t_signed <- t.test(pares_mensais$diff, mu = 0, conf.level = 0.95)
+t_signed   # saída “bruta” com resultado do teste
+
+m  <- as.numeric(t_signed$estimate)   # média estimada das diferenças
+lo <- t_signed$conf.int[1]           # limite inferior IC
+hi <- t_signed$conf.int[2]           # limite superior IC
+
+inclui_zero <- lo <= 0 && hi >= 0    # verifica se 0 está dentro do IC
+
+frase_ic <- if (!inclui_zero) {
+  if (m > 0) {
+    "Como zero não está no IC e ambos os limites são positivos, há evidência de viés sistemático com Donkelar > CAMS (em média)." 
+  } else {
+    "Como zero não está no IC e ambos os limites são negativos, há evidência de viés sistemático com Donkelar < CAMS (em média)."
+  }
+} else {
+  "Como zero está contido no IC, não há evidência estatística de viés sistemático (média das diferenças compatível com 0)."
+}
+
+txt_ic <- paste0(
+  "Média das diferenças (Donkelar − CAMS): ", sprintf("%.3f", m), " µg/m³. ",
+  "IC 95% = [ ", sprintf("%.3f", lo), " ; ", sprintf("%.3f", hi), " ] — ", frase_ic
+)
+
+htmltools::div(
+  style = "margin:8px 0 18px 0; padding:8px 12px; background:#f7faf9; border-left:4px solid #10B981;",
+  htmltools::HTML(txt_ic)
+)
+```
+
+---
+
+# 5. Conclusão
+
+Após os resultados apresentados, conclui-se que a base de dados vinda de Donkelar apresentou valores sistematicamente mais altos de PM2,5 em relação ao CAMS, mantendo essa diferença nos dois anos analisados. 
+
+Em termos temporais, ambos os conjuntos reproduzem de forma coerente o padrão sazonal típico da Amazônia, com concentrações mais elevadas no período seco (agosto a outubro) e menores nos meses úmidos.
